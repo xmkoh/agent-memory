@@ -31,10 +31,12 @@ def write_memory_file(filename: str, folder_path: str, content: str) -> str:
     """
     Saves a document or file content to the long-term Weaviate memory store.
     It saves the raw text and automatically creates semantic vector chunks.
+    If a file with the same name exists it is overwritten (upsert), so repeated
+    saves do not accumulate duplicates.
     Use this to persist knowledge, architecture documents, notes, or findings.
     """
     try:
-        memory_manager.write_markdown(filename, folder_path, content)
+        memory_manager.write_markdown(filename, folder_path, content, overwrite=True)
         return f"Successfully saved file '{filename}' to folder '{folder_path}' in long-term memory."
     except Exception as e:
         return f"Error writing file to memory: {e}"
@@ -94,12 +96,129 @@ def list_memory_files(folder_path: str) -> str:
     except Exception as e:
         return f"Error listing files: {e}"
 
+# --- Deepagents-style filesystem tools (backed by the Weaviate document store) ---
+
+@tool
+def ls(folder_path: str = None) -> str:
+    """
+    Lists files in the memory store with metadata (path, size in bytes, created_at).
+    Optionally restrict to a single folder_path. Use this to see what files exist.
+    """
+    try:
+        entries = memory_manager.ls(folder_path)
+        if not entries:
+            return "No files found."
+        lines = [f"{e['path']}\t{e['size']} bytes\t{e['created_at']}" for e in entries]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing files: {e}"
+
+@tool
+def read_file(filename: str, offset: int = 0, limit: int = 2000) -> str:
+    """
+    Reads a file's contents with 1-based line numbers (cat -n style).
+    For large files, use offset (0-based line index to start from) and limit
+    (max number of lines to return) to page through the content.
+    """
+    try:
+        content = memory_manager.read_file_by_name(filename)
+        if content == "File not found.":
+            return f"Error: file '{filename}' not found."
+        all_lines = content.splitlines()
+        window = all_lines[offset:offset + limit]
+        if not window:
+            return f"(no lines in range: offset={offset}, limit={limit}; file has {len(all_lines)} lines)"
+        numbered = [f"{offset + i + 1:6d}\t{line}" for i, line in enumerate(window)]
+        out = "\n".join(numbered)
+        if offset + limit < len(all_lines):
+            out += f"\n... ({len(all_lines) - (offset + limit)} more lines; increase offset/limit to continue)"
+        return out
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+@tool
+def write_file(filename: str, folder_path: str, content: str) -> str:
+    """
+    Creates a NEW file in the memory store. Fails if a file with the same name
+    already exists (use edit_file to modify an existing file instead).
+    """
+    try:
+        memory_manager.write_markdown(filename, folder_path, content, overwrite=False)
+        return f"Successfully created '{filename}' in '{folder_path}'."
+    except FileExistsError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+@tool
+def edit_file(filename: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """
+    Performs an exact string replacement inside an existing file.
+    By default old_string must appear exactly once (otherwise the edit fails as
+    ambiguous); set replace_all=True to replace every occurrence. The file's
+    semantic chunks are automatically re-indexed after the edit.
+    """
+    try:
+        n = memory_manager.edit_file(filename, old_string, new_string, replace_all)
+        return f"Made {n} replacement(s) in '{filename}'."
+    except Exception as e:
+        return f"Error editing file: {e}"
+
+@tool
+def glob(pattern: str) -> str:
+    """
+    Finds files whose path or name matches a glob pattern (e.g. '*.md',
+    'projects/alpha/*'). Returns matching full paths.
+    """
+    try:
+        matches = memory_manager.glob(pattern)
+        if not matches:
+            return f"No files match pattern '{pattern}'."
+        return "\n".join(matches)
+    except Exception as e:
+        return f"Error running glob: {e}"
+
+@tool
+def grep(pattern: str, output_mode: str = "content", restrict_to_folder: str = None,
+         path_glob: str = None, ignore_case: bool = False) -> str:
+    """
+    Searches file contents with a regular expression.
+    output_mode controls the result format:
+      - "content" (default): each match as 'path:line_number: line'
+      - "files_with_matches": just the unique file paths that contain a match
+      - "count": 'path: count' per file with matches
+    Optionally restrict_to_folder, filter files by path_glob, or set ignore_case=True.
+    """
+    try:
+        results = memory_manager.grep(pattern, restrict_to_folder, path_glob, ignore_case)
+        if not results:
+            return f"No matches for '{pattern}'."
+
+        if output_mode == "files_with_matches":
+            seen = sorted({r["path"] for r in results})
+            return "\n".join(seen)
+        if output_mode == "count":
+            counts = {}
+            for r in results:
+                counts[r["path"]] = counts.get(r["path"], 0) + 1
+            return "\n".join(f"{path}: {n}" for path, n in sorted(counts.items()))
+        # default: content mode
+        return "\n".join(f"{r['path']}:{r['line_number']}: {r['line']}" for r in results)
+    except Exception as e:
+        return f"Error running grep: {e}"
+
 tools = [
     write_memory_file,
     read_memory_file,
     search_memory,
     list_memory_folders,
-    list_memory_files
+    list_memory_files,
+    ls,
+    read_file,
+    write_file,
+    edit_file,
+    glob,
+    grep,
 ]
 
 # Map tool names to objects for execution
@@ -208,7 +327,8 @@ The production deployment will run on AWS ECS with auto-scaling groups.
 """
     })
     print(write_res)
-    
+    assert "Successfully saved" in write_res, f"write_memory_file did not succeed: {write_res}"
+
     # 2. Check directory mapping
     print("\nTest 2: Listing folders in memory...")
     folders_res = list_memory_folders.invoke({})
@@ -247,7 +367,113 @@ The production deployment will run on AWS ECS with auto-scaling groups.
     output_lower = res2.lower()
     assert "bob" in output_lower, "Agent failed to remember the user's name (Bob)"
     assert "aws" in output_lower or "ecs" in output_lower, "Agent failed to find AWS/ECS deployment from memory spec"
-    
+
+    # --- Filesystem tool tests (deterministic, no LLM involved) ---
+    fs_folder = "fs/tests"
+    fs_files = ["fs_notes.md", "fs_log.txt"]
+
+    def _cleanup_fs_files():
+        for fn in fs_files:
+            doc = memory_manager.get_document(fn)
+            if doc is not None:
+                memory_manager._delete_chunks_for(doc.uuid)
+                memory_manager.document_collection.data.delete_by_id(doc.uuid)
+
+    _cleanup_fs_files()  # ensure a clean slate from prior runs
+
+    # 7. write_file creates a new file
+    print("\nTest 7: write_file creates a new file...")
+    w_res = write_file.invoke({
+        "filename": "fs_notes.md",
+        "folder_path": fs_folder,
+        "content": "# Notes\nalpha line\n## Section\nbeta line\nbeta again\n"
+    })
+    print(w_res)
+    assert "Successfully created" in w_res, "write_file did not confirm creation"
+
+    # 8. write_file rejects a duplicate filename
+    print("\nTest 8: write_file rejects duplicate...")
+    dup_res = write_file.invoke({
+        "filename": "fs_notes.md", "folder_path": fs_folder, "content": "dup"
+    })
+    print(dup_res)
+    assert "already exists" in dup_res, "Duplicate write_file was not rejected"
+
+    # Second file for glob/grep coverage across files
+    write_file.invoke({
+        "filename": "fs_log.txt", "folder_path": fs_folder,
+        "content": "line one\nbeta in log\nline three\n"
+    })
+
+    # 9. ls returns the file with metadata
+    print("\nTest 9: ls returns files with metadata...")
+    ls_res = ls.invoke({"folder_path": fs_folder})
+    print(ls_res)
+    assert "fs/tests/fs_notes.md" in ls_res, "ls missing fs_notes.md"
+    assert "bytes" in ls_res, "ls missing size metadata"
+
+    # 10. glob finds matching files
+    print("\nTest 10: glob '*.md'...")
+    glob_res = glob.invoke({"pattern": "*.md"})
+    print(glob_res)
+    assert "fs/tests/fs_notes.md" in glob_res, "glob did not match fs_notes.md"
+    assert "fs/tests/fs_log.txt" not in glob_res, "glob '*.md' wrongly matched a .txt file"
+
+    # 11. grep across all three output modes
+    print("\nTest 11: grep output modes...")
+    content_mode = grep.invoke({"pattern": "beta", "restrict_to_folder": fs_folder})
+    print("content:\n" + content_mode)
+    assert "fs/tests/fs_notes.md:" in content_mode, "grep content mode missing path:line"
+
+    files_mode = grep.invoke({
+        "pattern": "beta", "output_mode": "files_with_matches", "restrict_to_folder": fs_folder
+    })
+    print("files_with_matches:\n" + files_mode)
+    assert "fs/tests/fs_notes.md" in files_mode and "fs/tests/fs_log.txt" in files_mode, \
+        "grep files_with_matches missing a file"
+
+    count_mode = grep.invoke({
+        "pattern": "beta", "output_mode": "count", "restrict_to_folder": fs_folder
+    })
+    print("count:\n" + count_mode)
+    assert "fs/tests/fs_notes.md: 2" in count_mode, "grep count mode wrong (expected 2 in fs_notes.md)"
+
+    # 12. read_file with offset/limit returns a numbered window
+    print("\nTest 12: read_file offset/limit numbering...")
+    read_res = read_file.invoke({"filename": "fs_notes.md", "offset": 1, "limit": 2})
+    print(read_res)
+    assert "     2\talpha line" in read_res, "read_file did not number line 2 from the offset"
+    assert "# Notes" not in read_res, "read_file offset=1 did not skip line 1"
+
+    # 13. edit_file: rejects non-unique, succeeds on unique, replace_all replaces all
+    print("\nTest 13: edit_file unique / ambiguous / replace_all...")
+    ambig = edit_file.invoke({
+        "filename": "fs_notes.md", "old_string": "beta", "new_string": "BETA"
+    })
+    print(ambig)
+    assert "not unique" in ambig, "edit_file did not reject a non-unique old_string"
+
+    unique = edit_file.invoke({
+        "filename": "fs_notes.md", "old_string": "alpha line", "new_string": "gamma line"
+    })
+    print(unique)
+    assert "Made 1 replacement" in unique, "edit_file unique replace failed"
+
+    all_res = edit_file.invoke({
+        "filename": "fs_notes.md", "old_string": "beta", "new_string": "BETA", "replace_all": True
+    })
+    print(all_res)
+    assert "Made 2 replacement" in all_res, "edit_file replace_all did not replace both occurrences"
+
+    # 14. semantic search sees the edited content (re-chunking worked)
+    print("\nTest 14: search reflects edited content...")
+    edited_search = search_memory.invoke({"query": "gamma line"})
+    print(edited_search)
+    assert "gamma" in edited_search.lower(), "Edit was not re-indexed for semantic search"
+
+    _cleanup_fs_files()
+    print("Cleaned up filesystem test files.")
+
     print("\nAll integration tests passed successfully!")
     client.close()
 

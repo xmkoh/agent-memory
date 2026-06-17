@@ -4,6 +4,7 @@ from weaviate.classes.query import Filter
 from datetime import datetime, timezone
 import uuid
 import re
+import fnmatch
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 
@@ -63,9 +64,60 @@ class WeaviateMemoryManager:
                 vectorizer_config=Configure.Vectorizer.none()
             )
 
-    def write_markdown(self, filename: str, folder_path: str, content: str):
-        """Ingests a file, saves the raw text, and streams vectorized chunks."""
-        
+    def _chunk_content(self, content: str) -> list:
+        """Naive Markdown chunking (splits by ## headers). Returns chunk dicts."""
+        sections = re.split(r'(?m)^## ', content)
+        intro = sections.pop(0) if sections else ""
+
+        chunks = []
+        if intro.strip():
+            chunks.append({"heading": "Introduction", "chunk_text": intro.strip()})
+
+        for section in sections:
+            lines = section.split('\n', 1)
+            heading = lines[0].strip()
+            chunk_text = lines[1].strip() if len(lines) > 1 else ""
+            if chunk_text:
+                chunks.append({"heading": heading, "chunk_text": chunk_text})
+        return chunks
+
+    def _insert_chunks(self, chunks: list, doc_uuid):
+        """Inserts vectorized chunks cross-referenced to a parent document."""
+        for chunk in chunks:
+            self.chunk_collection.data.insert(
+                properties=chunk,
+                references={"hasDocument": doc_uuid}
+            )
+
+    def _delete_chunks_for(self, doc_uuid):
+        """Removes all chunks referencing a given parent document."""
+        self.chunk_collection.data.delete_many(
+            where=Filter.by_ref("hasDocument").by_id().equal(doc_uuid)
+        )
+
+    def get_document(self, filename: str):
+        """Returns the raw Weaviate object for a file (uuid + properties), or None."""
+        response = self.document_collection.query.fetch_objects(
+            filters=Filter.by_property("filename").equal(filename),
+            limit=1
+        )
+        return response.objects[0] if response.objects else None
+
+    def write_markdown(self, filename: str, folder_path: str, content: str, overwrite: bool = False):
+        """Ingests a file, saves the raw text, and streams vectorized chunks.
+
+        If overwrite=True and a file with the same name exists, the existing
+        document and its chunks are replaced rather than duplicated.
+        """
+        existing = self.get_document(filename)
+        if existing is not None:
+            if not overwrite:
+                raise FileExistsError(
+                    f"File '{filename}' already exists. Use edit_file or overwrite to modify it."
+                )
+            self._delete_chunks_for(existing.uuid)
+            self.document_collection.data.delete_by_id(existing.uuid)
+
         # 1. Save the Parent Document
         doc_uuid = uuid.uuid4()
         self.document_collection.data.insert(
@@ -78,28 +130,101 @@ class WeaviateMemoryManager:
             }
         )
 
-        # 2. Naive Markdown Chunking (Splits by ## Headers)
-        sections = re.split(r'(?m)^## ', content)
-        intro = sections.pop(0) if sections else ""
-        
-        chunks_to_insert = []
-        if intro.strip():
-            chunks_to_insert.append({"heading": "Introduction", "chunk_text": intro.strip()})
-            
-        for section in sections:
-            lines = section.split('\n', 1)
-            heading = lines[0].strip()
-            chunk_text = lines[1].strip() if len(lines) > 1 else ""
-            if chunk_text:
-                chunks_to_insert.append({"heading": heading, "chunk_text": chunk_text})
+        # 2 & 3. Chunk the markdown and insert vectorized children.
+        chunks = self._chunk_content(content)
+        self._insert_chunks(chunks, doc_uuid)
+        print(f"Successfully ingested {filename} into {len(chunks)} chunks.")
 
-        # 3. Insert Chunks with Cross-Reference to Parent
-        for chunk in chunks_to_insert:
-            self.chunk_collection.data.insert(
-                properties=chunk,
-                references={"hasDocument": doc_uuid}
+    def edit_file(self, filename: str, old_string: str, new_string: str, replace_all: bool = False) -> int:
+        """Exact string replacement inside a file's raw content, then re-chunks.
+
+        Returns the number of replacements made. Raises if the file is missing,
+        the string is not found, or (when replace_all is False) it is ambiguous.
+        """
+        doc = self.get_document(filename)
+        if doc is None:
+            raise FileNotFoundError(f"File '{filename}' not found.")
+
+        content = doc.properties["raw_content"]
+        count = content.count(old_string)
+        if count == 0:
+            raise ValueError(f"old_string not found in '{filename}'.")
+        if count > 1 and not replace_all:
+            raise ValueError(
+                f"old_string is not unique in '{filename}' ({count} matches). "
+                f"Provide more context or set replace_all=True."
             )
-        print(f"Successfully ingested {filename} into {len(chunks_to_insert)} chunks.")
+
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+            count = 1
+
+        # Update raw content and rebuild the semantic chunks to match.
+        self.document_collection.data.update(
+            uuid=doc.uuid,
+            properties={"raw_content": new_content}
+        )
+        self._delete_chunks_for(doc.uuid)
+        self._insert_chunks(self._chunk_content(new_content), doc.uuid)
+        return count
+
+    def _all_documents(self, restrict_to_folder: str = None) -> list:
+        """Fetches every stored document (optionally within one folder)."""
+        kwargs = {
+            "limit": 10000,
+            "return_properties": ["filename", "folder_path", "raw_content", "created_at"],
+        }
+        if restrict_to_folder:
+            kwargs["filters"] = Filter.by_property("folder_path").equal(restrict_to_folder)
+        return self.document_collection.query.fetch_objects(**kwargs).objects
+
+    def ls(self, folder_path: str = None) -> list:
+        """Lists files with metadata (path, size in bytes, created_at)."""
+        entries = []
+        for obj in self._all_documents(folder_path):
+            p = obj.properties
+            entries.append({
+                "path": f"{p['folder_path']}/{p['filename']}",
+                "filename": p["filename"],
+                "folder_path": p["folder_path"],
+                "size": len(p.get("raw_content") or ""),
+                "created_at": p.get("created_at"),
+            })
+        return sorted(entries, key=lambda e: e["path"])
+
+    def glob(self, pattern: str) -> list:
+        """Returns full paths matching a glob pattern (matched on path and filename)."""
+        matches = []
+        for obj in self._all_documents():
+            p = obj.properties
+            full_path = f"{p['folder_path']}/{p['filename']}"
+            if fnmatch.fnmatch(full_path, pattern) or fnmatch.fnmatch(p["filename"], pattern):
+                matches.append(full_path)
+        return sorted(matches)
+
+    def grep(self, pattern: str, restrict_to_folder: str = None,
+             path_glob: str = None, ignore_case: bool = False) -> list:
+        """Regex search across file contents.
+
+        Returns a list of match dicts: {path, line_number, line}. Output
+        formatting (content / files / count) is handled by the caller.
+        """
+        flags = re.IGNORECASE if ignore_case else 0
+        regex = re.compile(pattern, flags)
+        results = []
+        for obj in self._all_documents(restrict_to_folder):
+            p = obj.properties
+            full_path = f"{p['folder_path']}/{p['filename']}"
+            if path_glob and not (
+                fnmatch.fnmatch(full_path, path_glob) or fnmatch.fnmatch(p["filename"], path_glob)
+            ):
+                continue
+            for i, line in enumerate((p.get("raw_content") or "").splitlines(), start=1):
+                if regex.search(line):
+                    results.append({"path": full_path, "line_number": i, "line": line})
+        return results
 
     def read_file_by_name(self, filename: str) -> str:
         """Deterministic exact-match lookup for full file restoration."""
