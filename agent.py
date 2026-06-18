@@ -478,6 +478,89 @@ The production deployment will run on AWS ECS with auto-scaling groups.
     _cleanup_fs_files()
     print("Cleaned up filesystem test files.")
 
+    # --- Conflict-check tests ---
+    conflict_file = "conflict_check.md"
+    conflict_folder = "fs/tests"
+
+    def _cleanup_conflict_file():
+        doc = memory_manager.get_document(conflict_file)
+        if doc is not None:
+            memory_manager._delete_chunks_for(doc.uuid)
+            memory_manager.document_collection.data.delete_by_id(doc.uuid)
+
+    def _external_modify(new_content: str):
+        """Simulates an out-of-band edit by updating Weaviate directly,
+        bypassing the manager so _read_hashes is not refreshed."""
+        doc = memory_manager.get_document(conflict_file)
+        memory_manager.document_collection.data.update(
+            uuid=doc.uuid,
+            properties={"raw_content": new_content}
+        )
+
+    _cleanup_conflict_file()
+
+    # 15. ConflictError fires on edit when file changed after read
+    print("\nTest 15: ConflictError on edit after external modification...")
+    write_file.invoke({
+        "filename": conflict_file, "folder_path": conflict_folder,
+        "content": "# Conflict\noriginal content\n"
+    })
+    read_file.invoke({"filename": conflict_file})          # records hash
+    _external_modify("# Conflict\nmodified externally\n")  # out-of-band change
+    conflict_edit_res = edit_file.invoke({
+        "filename": conflict_file, "old_string": "original content", "new_string": "new content"
+    })
+    print(conflict_edit_res)
+    assert "Conflict" in conflict_edit_res, "edit_file did not raise ConflictError after external modification"
+
+    # 16. ConflictError fires on overwrite-write when file changed after read
+    print("\nTest 16: ConflictError on write (overwrite) after external modification...")
+    # _read_hashes still holds the old hash from test 15 read
+    conflict_write_res = write_memory_file.invoke({
+        "filename": conflict_file, "folder_path": conflict_folder,
+        "content": "# Conflict\noverwrite attempt\n"
+    })
+    print(conflict_write_res)
+    assert "Conflict" in conflict_write_res, "write_memory_file did not raise ConflictError after external modification"
+
+    # 17. Re-reading the file clears the conflict — edit succeeds afterwards
+    print("\nTest 17: Re-reading clears conflict, subsequent edit succeeds...")
+    read_file.invoke({"filename": conflict_file})  # re-read records new hash
+    reread_edit_res = edit_file.invoke({
+        "filename": conflict_file, "old_string": "modified externally", "new_string": "restored content"
+    })
+    print(reread_edit_res)
+    assert "Made 1 replacement" in reread_edit_res, "edit_file failed after re-read cleared the conflict"
+
+    # 18. No conflict check fires when the file has never been read this session
+    print("\nTest 18: No conflict check when file was not read this session...")
+    # Simulate a file that exists in the store but has no entry in _read_hashes
+    # by inserting it directly and then removing it from the cache.
+    direct_file = "direct_insert.md"
+    direct_doc = memory_manager.get_document(direct_file)
+    if direct_doc is not None:
+        memory_manager._delete_chunks_for(direct_doc.uuid)
+        memory_manager.document_collection.data.delete_by_id(direct_doc.uuid)
+    write_file.invoke({
+        "filename": direct_file, "folder_path": conflict_folder,
+        "content": "# Direct\nsome content\n"
+    })
+    memory_manager._read_hashes.pop(direct_file, None)  # clear the cached hash
+    no_conflict_res = edit_file.invoke({
+        "filename": direct_file, "old_string": "some content", "new_string": "edited content"
+    })
+    print(no_conflict_res)
+    assert "Made 1 replacement" in no_conflict_res, "edit_file incorrectly blocked an edit with no prior read"
+
+    # clean up
+    _cleanup_conflict_file()
+    for fn in [direct_file]:
+        doc = memory_manager.get_document(fn)
+        if doc is not None:
+            memory_manager._delete_chunks_for(doc.uuid)
+            memory_manager.document_collection.data.delete_by_id(doc.uuid)
+    print("Cleaned up conflict-check test files.")
+
     print("\nAll integration tests passed successfully!")
     client.close()
 
