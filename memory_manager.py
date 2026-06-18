@@ -5,14 +5,20 @@ from datetime import datetime, timezone
 import uuid
 import re
 import fnmatch
+import hashlib
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+
+
+class ConflictError(Exception):
+    """Raised when a write or edit conflicts with a concurrent modification."""
 
 class WeaviateMemoryManager:
     def __init__(self, client: weaviate.WeaviateClient):
         self.client = client
         self._initialize_schema()
-        
+        self._read_hashes: dict[str, str] = {}
+
         # Get references to the collections
         self.document_collection = self.client.collections.get("Document")
         self.chunk_collection = self.client.collections.get("Chunk")
@@ -103,11 +109,30 @@ class WeaviateMemoryManager:
         )
         return response.objects[0] if response.objects else None
 
+    def _hash(self, raw: str) -> str:
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def _record_read(self, filename: str, raw: str):
+        self._read_hashes[filename] = self._hash(raw)
+
+    def _check_conflict(self, filename: str, current_raw: str):
+        """Raises ConflictError if the file changed since it was last read this session."""
+        prior = self._read_hashes.get(filename)
+        if prior is None:
+            return
+        if self._hash(current_raw) != prior:
+            raise ConflictError(
+                f"Conflict on '{filename}': the file was modified since you last read it. "
+                f"Re-read the file and retry your changes."
+            )
+
     def write_markdown(self, filename: str, folder_path: str, content: str, overwrite: bool = False):
         """Ingests a file, saves the raw text, and streams vectorized chunks.
 
         If overwrite=True and a file with the same name exists, the existing
         document and its chunks are replaced rather than duplicated.
+        If the file was read earlier in this session, raises ConflictError when
+        the stored content has changed since that read.
         """
         existing = self.get_document(filename)
         if existing is not None:
@@ -115,6 +140,8 @@ class WeaviateMemoryManager:
                 raise FileExistsError(
                     f"File '{filename}' already exists. Use edit_file or overwrite to modify it."
                 )
+            current_raw = existing.properties.get("raw_content") or ""
+            self._check_conflict(filename, current_raw)
             self._delete_chunks_for(existing.uuid)
             self.document_collection.data.delete_by_id(existing.uuid)
 
@@ -133,6 +160,7 @@ class WeaviateMemoryManager:
         # 2 & 3. Chunk the markdown and insert vectorized children.
         chunks = self._chunk_content(content)
         self._insert_chunks(chunks, doc_uuid)
+        self._read_hashes[filename] = self._hash(content)
         print(f"Successfully ingested {filename} into {len(chunks)} chunks.")
 
     def edit_file(self, filename: str, old_string: str, new_string: str, replace_all: bool = False) -> int:
@@ -140,12 +168,14 @@ class WeaviateMemoryManager:
 
         Returns the number of replacements made. Raises if the file is missing,
         the string is not found, or (when replace_all is False) it is ambiguous.
+        Raises ConflictError if the file changed since it was last read this session.
         """
         doc = self.get_document(filename)
         if doc is None:
             raise FileNotFoundError(f"File '{filename}' not found.")
 
         content = doc.properties["raw_content"]
+        self._check_conflict(filename, content)
         count = content.count(old_string)
         if count == 0:
             raise ValueError(f"old_string not found in '{filename}'.")
@@ -168,6 +198,7 @@ class WeaviateMemoryManager:
         )
         self._delete_chunks_for(doc.uuid)
         self._insert_chunks(self._chunk_content(new_content), doc.uuid)
+        self._read_hashes[filename] = self._hash(new_content)
         return count
 
     def _all_documents(self, restrict_to_folder: str = None) -> list:
@@ -234,8 +265,10 @@ class WeaviateMemoryManager:
         )
         if not response.objects:
             return "File not found."
-        
-        return response.objects[0].properties["raw_content"]
+
+        raw = response.objects[0].properties["raw_content"]
+        self._record_read(filename, raw)
+        return raw
 
     def search_knowledge_base(self, query: str, restrict_to_folder: str = None) -> list:
         """Agentic semantic search across all Markdown chunks."""
