@@ -604,6 +604,127 @@ The production deployment will run on AWS ECS with auto-scaling groups.
             memory_manager.document_collection.data.delete_by_id(doc.uuid)
     print("Cleaned up conflict-check test files.")
 
+    # --- WeaviateStore tests ---
+    import random
+    import hashlib as _hl
+    from weaviate_store import WeaviateStore
+    from weaviate.classes.query import Filter as _Filter
+
+    def _mock_embedder(text: str) -> list[float]:
+        """Deterministic 384-dim unit vector derived from text — no inference service needed."""
+        seed = int(_hl.md5(text.encode()).hexdigest(), 16) % (2**32)
+        rng = random.Random(seed)
+        vec = [rng.gauss(0, 1) for _ in range(384)]
+        norm = sum(x * x for x in vec) ** 0.5
+        return [x / norm for x in vec]
+
+    store = WeaviateStore(client, embedder=_mock_embedder)
+
+    def _cleanup_store(*namespaces):
+        for ns in namespaces:
+            ns_str = "\x1f".join(ns)
+            store.col.data.delete_many(
+                where=_Filter.by_property("namespace").equal(ns_str)
+            )
+
+    ns_a = ("store_test", "alpha")
+    ns_b = ("store_test", "beta")
+    ns_deep = ("store_test", "alpha", "deep")
+    _cleanup_store(ns_a, ns_b, ns_deep)
+
+    # 19. put and get round-trip
+    print("\nTest 19: WeaviateStore put and get...")
+    store.put(ns_a, "k1", {"msg": "hello world"}, index=True)
+    item = store.get(ns_a, "k1")
+    assert item is not None, "get returned None after put"
+    assert item.key == "k1", "item key mismatch"
+    assert item.namespace == ns_a, "item namespace mismatch"
+    assert item.value == {"msg": "hello world"}, "item value mismatch"
+    assert item.created_at is not None, "created_at missing"
+    print(f"  got: {item.value}")
+
+    # 20. get on missing key returns None
+    print("\nTest 20: WeaviateStore get on missing key returns None...")
+    missing = store.get(ns_a, "does_not_exist")
+    assert missing is None, "get on missing key did not return None"
+    print("  returned None as expected")
+
+    # 21. put upserts (second put with same key updates value)
+    print("\nTest 21: WeaviateStore upsert via repeated put...")
+    store.put(ns_a, "k1", {"msg": "updated"}, index=True)
+    updated = store.get(ns_a, "k1")
+    assert updated.value == {"msg": "updated"}, "upsert did not update value"
+    assert updated.updated_at >= updated.created_at, "updated_at not refreshed"
+    print(f"  updated value: {updated.value}")
+
+    # 22. delete removes the item
+    print("\nTest 22: WeaviateStore delete...")
+    store.put(ns_a, "to_delete", {"x": 1})
+    store.delete(ns_a, "to_delete")
+    assert store.get(ns_a, "to_delete") is None, "item still present after delete"
+    store.delete(ns_a, "to_delete")  # deleting a non-existent key must not raise
+    print("  deleted successfully; double-delete did not raise")
+
+    # 23. list_namespaces returns distinct namespaces
+    print("\nTest 23: WeaviateStore list_namespaces...")
+    store.put(ns_a, "x", {"v": 1})
+    store.put(ns_b, "y", {"v": 2})
+    store.put(ns_deep, "z", {"v": 3})
+    all_ns = store.list_namespaces()
+    assert ns_a in all_ns, f"ns_a missing from list_namespaces: {all_ns}"
+    assert ns_b in all_ns, f"ns_b missing from list_namespaces: {all_ns}"
+    print(f"  namespaces: {all_ns}")
+
+    # 24. list_namespaces prefix filter
+    print("\nTest 24: WeaviateStore list_namespaces with prefix...")
+    prefix_ns = store.list_namespaces(prefix=("store_test",))
+    assert ns_a in prefix_ns, "ns_a missing with prefix filter"
+    assert ns_b in prefix_ns, "ns_b missing with prefix filter"
+    assert all(ns[0] == "store_test" for ns in prefix_ns), \
+        "prefix filter let through wrong namespace"
+    print(f"  filtered: {prefix_ns}")
+
+    # 25. list_namespaces max_depth truncates namespace tuples
+    print("\nTest 25: WeaviateStore list_namespaces max_depth=1...")
+    depth1 = store.list_namespaces(prefix=("store_test",), max_depth=1)
+    assert all(len(ns) == 1 for ns in depth1), \
+        f"max_depth=1 did not truncate: {depth1}"
+    assert ("store_test",) in depth1, "truncated root namespace missing"
+    print(f"  depth-1 namespaces: {depth1}")
+
+    # 26. search without query returns items by namespace prefix (no ranking)
+    print("\nTest 26: WeaviateStore search without query...")
+    unranked = store.search(("store_test",))
+    paths = [(r.namespace, r.key) for r in unranked]
+    assert any(ns == ns_a for ns, _ in paths), "ns_a items missing from unranked search"
+    assert any(ns == ns_b for ns, _ in paths), "ns_b items missing from unranked search"
+    print(f"  returned {len(unranked)} items")
+
+    # 27. search with query returns ranked SearchItems with scores
+    print("\nTest 27: WeaviateStore search with query (near_vector)...")
+    store.put(ns_a, "doc_cat",  {"content": "cats are fluffy animals"}, index=["content"])
+    store.put(ns_a, "doc_dog",  {"content": "dogs are loyal companions"}, index=["content"])
+    store.put(ns_a, "doc_car",  {"content": "cars have four wheels"}, index=["content"])
+    ranked = store.search(("store_test", "alpha"), query="feline pets")
+    assert len(ranked) > 0, "near_vector search returned no results"
+    assert all(r.score is not None for r in ranked), "SearchItem scores missing"
+    # Scores should be in descending order (Weaviate returns highest certainty first)
+    scores = [r.score for r in ranked]
+    assert scores == sorted(scores, reverse=True), f"results not sorted by score: {scores}"
+    print(f"  top result: {ranked[0].value!r} (score={ranked[0].score:.4f})")
+
+    # 28. items stored with index=False have no vector and are excluded from near_vector
+    print("\nTest 28: index=False items excluded from vector search...")
+    store.put(ns_a, "no_vec", {"content": "feline cats pets kittens"}, index=False)
+    ranked2 = store.search(("store_test", "alpha"), query="feline pets")
+    no_vec_keys = [r.key for r in ranked2]
+    assert "no_vec" not in no_vec_keys, \
+        "index=False item incorrectly appeared in near_vector results"
+    print("  index=False item correctly excluded from ranked search")
+
+    _cleanup_store(ns_a, ns_b, ns_deep)
+    print("Cleaned up WeaviateStore test items.")
+
     print("\nAll integration tests passed successfully!")
     client.close()
 
