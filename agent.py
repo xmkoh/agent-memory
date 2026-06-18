@@ -114,6 +114,22 @@ def ls(folder_path: str = None) -> str:
         return f"Error listing files: {e}"
 
 @tool
+def get_file_hash(filename: str) -> str:
+    """
+    Returns the MD5 content hash of a file currently in memory.
+    Pass this hash to write_file or edit_file as expected_hash to detect
+    concurrent modifications before overwriting.
+    Returns 'File not found.' if the file does not exist.
+    """
+    try:
+        h = memory_manager.content_hash(filename)
+        if h is None:
+            return "File not found."
+        return h
+    except Exception as e:
+        return f"Error getting file hash: {e}"
+
+@tool
 def read_file(filename: str, offset: int = 0, limit: int = 2000) -> str:
     """
     Reads a file's contents with 1-based line numbers (cat -n style).
@@ -137,13 +153,16 @@ def read_file(filename: str, offset: int = 0, limit: int = 2000) -> str:
         return f"Error reading file: {e}"
 
 @tool
-def write_file(filename: str, folder_path: str, content: str) -> str:
+def write_file(filename: str, folder_path: str, content: str, expected_hash: str = None) -> str:
     """
     Creates a NEW file in the memory store. Fails if a file with the same name
     already exists (use edit_file to modify an existing file instead).
+    Pass expected_hash (from get_file_hash) when overwriting to detect concurrent
+    modifications; the write is rejected with a ConflictError if the file changed.
     """
     try:
-        memory_manager.write_markdown(filename, folder_path, content, overwrite=False)
+        memory_manager.write_markdown(filename, folder_path, content, overwrite=False,
+                                      expected_hash=expected_hash)
         return f"Successfully created '{filename}' in '{folder_path}'."
     except FileExistsError as e:
         return f"Error: {e}"
@@ -151,15 +170,19 @@ def write_file(filename: str, folder_path: str, content: str) -> str:
         return f"Error writing file: {e}"
 
 @tool
-def edit_file(filename: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+def edit_file(filename: str, old_string: str, new_string: str, replace_all: bool = False,
+              expected_hash: str = None) -> str:
     """
     Performs an exact string replacement inside an existing file.
     By default old_string must appear exactly once (otherwise the edit fails as
     ambiguous); set replace_all=True to replace every occurrence. The file's
     semantic chunks are automatically re-indexed after the edit.
+    Optionally pass expected_hash (from get_file_hash) to guard against concurrent
+    edits; the operation is rejected with a ConflictError if the content changed.
     """
     try:
-        n = memory_manager.edit_file(filename, old_string, new_string, replace_all)
+        n = memory_manager.edit_file(filename, old_string, new_string, replace_all,
+                                     expected_hash=expected_hash)
         return f"Made {n} replacement(s) in '{filename}'."
     except Exception as e:
         return f"Error editing file: {e}"
@@ -215,6 +238,7 @@ tools = [
     list_memory_files,
     ls,
     read_file,
+    get_file_hash,
     write_file,
     edit_file,
     glob,
