@@ -17,7 +17,8 @@ class WeaviateMemoryManager:
     def __init__(self, client: weaviate.WeaviateClient):
         self.client = client
         self._initialize_schema()
-        
+        self._read_hashes: dict[str, str] = {}
+
         # Get references to the collections
         self.document_collection = self.client.collections.get("Document")
         self.chunk_collection = self.client.collections.get("Chunk")
@@ -108,29 +109,30 @@ class WeaviateMemoryManager:
         )
         return response.objects[0] if response.objects else None
 
-    def content_hash(self, filename: str) -> str | None:
-        """Returns the MD5 hex digest of the file's current raw content, or None if not found."""
-        doc = self.get_document(filename)
-        if doc is None:
-            return None
-        raw = doc.properties.get("raw_content") or ""
+    def _hash(self, raw: str) -> str:
         return hashlib.md5(raw.encode()).hexdigest()
 
-    def _check_hash(self, filename: str, expected_hash: str, current_raw: str):
-        """Raises ConflictError if the current content hash doesn't match expected_hash."""
-        actual = hashlib.md5(current_raw.encode()).hexdigest()
-        if actual != expected_hash:
+    def _record_read(self, filename: str, raw: str):
+        self._read_hashes[filename] = self._hash(raw)
+
+    def _check_conflict(self, filename: str, current_raw: str):
+        """Raises ConflictError if the file changed since it was last read this session."""
+        prior = self._read_hashes.get(filename)
+        if prior is None:
+            return
+        if self._hash(current_raw) != prior:
             raise ConflictError(
-                f"Conflict detected on '{filename}': the file was modified since you last read it. "
+                f"Conflict on '{filename}': the file was modified since you last read it. "
                 f"Re-read the file and retry your changes."
             )
 
-    def write_markdown(self, filename: str, folder_path: str, content: str, overwrite: bool = False,
-                       expected_hash: str = None):
+    def write_markdown(self, filename: str, folder_path: str, content: str, overwrite: bool = False):
         """Ingests a file, saves the raw text, and streams vectorized chunks.
 
         If overwrite=True and a file with the same name exists, the existing
         document and its chunks are replaced rather than duplicated.
+        If the file was read earlier in this session, raises ConflictError when
+        the stored content has changed since that read.
         """
         existing = self.get_document(filename)
         if existing is not None:
@@ -138,9 +140,8 @@ class WeaviateMemoryManager:
                 raise FileExistsError(
                     f"File '{filename}' already exists. Use edit_file or overwrite to modify it."
                 )
-            if expected_hash is not None:
-                current_raw = existing.properties.get("raw_content") or ""
-                self._check_hash(filename, expected_hash, current_raw)
+            current_raw = existing.properties.get("raw_content") or ""
+            self._check_conflict(filename, current_raw)
             self._delete_chunks_for(existing.uuid)
             self.document_collection.data.delete_by_id(existing.uuid)
 
@@ -159,23 +160,22 @@ class WeaviateMemoryManager:
         # 2 & 3. Chunk the markdown and insert vectorized children.
         chunks = self._chunk_content(content)
         self._insert_chunks(chunks, doc_uuid)
+        self._read_hashes[filename] = self._hash(content)
         print(f"Successfully ingested {filename} into {len(chunks)} chunks.")
 
-    def edit_file(self, filename: str, old_string: str, new_string: str, replace_all: bool = False,
-                  expected_hash: str = None) -> int:
+    def edit_file(self, filename: str, old_string: str, new_string: str, replace_all: bool = False) -> int:
         """Exact string replacement inside a file's raw content, then re-chunks.
 
         Returns the number of replacements made. Raises if the file is missing,
         the string is not found, or (when replace_all is False) it is ambiguous.
-        Pass expected_hash (from content_hash()) to guard against concurrent edits.
+        Raises ConflictError if the file changed since it was last read this session.
         """
         doc = self.get_document(filename)
         if doc is None:
             raise FileNotFoundError(f"File '{filename}' not found.")
 
         content = doc.properties["raw_content"]
-        if expected_hash is not None:
-            self._check_hash(filename, expected_hash, content)
+        self._check_conflict(filename, content)
         count = content.count(old_string)
         if count == 0:
             raise ValueError(f"old_string not found in '{filename}'.")
@@ -198,6 +198,7 @@ class WeaviateMemoryManager:
         )
         self._delete_chunks_for(doc.uuid)
         self._insert_chunks(self._chunk_content(new_content), doc.uuid)
+        self._read_hashes[filename] = self._hash(new_content)
         return count
 
     def _all_documents(self, restrict_to_folder: str = None) -> list:
@@ -264,8 +265,10 @@ class WeaviateMemoryManager:
         )
         if not response.objects:
             return "File not found."
-        
-        return response.objects[0].properties["raw_content"]
+
+        raw = response.objects[0].properties["raw_content"]
+        self._record_read(filename, raw)
+        return raw
 
     def search_knowledge_base(self, query: str, restrict_to_folder: str = None) -> list:
         """Agentic semantic search across all Markdown chunks."""
