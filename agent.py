@@ -6,6 +6,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from memory_manager import WeaviateMemoryManager, WeaviateChatMessageHistory
+from weaviate_store import WeaviateStore
 
 # Ensure API credentials are set
 token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
@@ -228,6 +229,48 @@ tools = [
 # Map tool names to objects for execution
 tool_map = {t.name: t for t in tools}
 llm_with_tools = llm.bind_tools(tools)
+
+
+def create_deep_agent(store: WeaviateStore | None = None):
+    """
+    Build and return a compiled LangGraph ReAct agent.
+
+    Passing a WeaviateStore as ``store`` wires Weaviate as LangGraph's
+    persistence layer for semantic memory.  The agent's tools can then read
+    and write named memories via store.put / store.search, and the graph
+    runtime makes the store available to every tool through the run config.
+
+    Example::
+
+        client = weaviate.connect_to_local()
+        store  = WeaviateStore(client)
+        agent  = create_deep_agent(store=store)
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": "Remember that I prefer AWS."}]},
+            config={"configurable": {"thread_id": "session-1"}},
+        )
+
+    Requires langgraph >= 0.2 and langgraph-checkpoint (for MemorySaver).
+    """
+    from langgraph.prebuilt import create_react_agent
+    from langgraph.checkpoint.memory import MemorySaver
+
+    system_prompt = (
+        "You are an advanced AI research assistant with access to two types of memory:\n"
+        "1. Short-term conversational memory: tracked automatically by the runtime.\n"
+        "2. Long-term file memory: a Weaviate-backed document store you can search, "
+        "read, and write using your tools.\n"
+        "Always check your memory or read relevant files when you need context."
+    )
+
+    return create_react_agent(
+        model=llm,
+        tools=tools,
+        store=store,
+        checkpointer=MemorySaver(),
+        prompt=system_prompt,
+    )
+
 
 # Conversational Agent Loop with Memory persistence
 def execute_agent(user_input: str, thread_id: str) -> str:
