@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import asyncio
 import weaviate
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
@@ -231,45 +232,26 @@ tool_map = {t.name: t for t in tools}
 llm_with_tools = llm.bind_tools(tools)
 
 
-def create_deep_agent(store: WeaviateStore | None = None):
+def build_weaviate_store() -> WeaviateStore:
     """
-    Build and return a compiled LangGraph ReAct agent.
+    Construct the Weaviate-backed LangGraph store.
 
-    Passing a WeaviateStore as ``store`` wires Weaviate as LangGraph's
-    persistence layer for semantic memory.  The agent's tools can then read
-    and write named memories via store.put / store.search, and the graph
-    runtime makes the store available to every tool through the run config.
+    Hand the returned store straight to LangChain Deep Agents'
+    ``create_deep_agent`` to make Weaviate the actual persistence layer — no
+    custom agent wrapper is needed; ``WeaviateStore`` implements the LangGraph
+    ``BaseStore`` contract that Deep Agents expects::
 
-    Example::
+        from deepagents import create_deep_agent
+        from deepagents.backends import StoreBackend
 
-        client = weaviate.connect_to_local()
-        store  = WeaviateStore(client)
-        agent  = create_deep_agent(store=store)
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": "Remember that I prefer AWS."}]},
-            config={"configurable": {"thread_id": "session-1"}},
+        store = build_weaviate_store()
+        agent = create_deep_agent(
+            model="anthropic:claude-sonnet-4-6",
+            backend=StoreBackend(),   # routes filesystem tools to the store
+            store=store,              # cross-thread durable persistence in Weaviate
         )
-
-    Requires langgraph >= 0.2 and langgraph-checkpoint (for MemorySaver).
     """
-    from langgraph.prebuilt import create_react_agent
-    from langgraph.checkpoint.memory import MemorySaver
-
-    system_prompt = (
-        "You are an advanced AI research assistant with access to two types of memory:\n"
-        "1. Short-term conversational memory: tracked automatically by the runtime.\n"
-        "2. Long-term file memory: a Weaviate-backed document store you can search, "
-        "read, and write using your tools.\n"
-        "Always check your memory or read relevant files when you need context."
-    )
-
-    return create_react_agent(
-        model=llm,
-        tools=tools,
-        store=store,
-        checkpointer=MemorySaver(),
-        prompt=system_prompt,
-    )
+    return WeaviateStore(client)
 
 
 # Conversational Agent Loop with Memory persistence
@@ -722,7 +704,65 @@ The production deployment will run on AWS ECS with auto-scaling groups.
         "index=False item incorrectly appeared in near_vector results"
     print("  index=False item correctly excluded from ranked search")
 
-    _cleanup_store(ns_a, ns_b, ns_deep)
+    # 29. Async contract: aput / aget / asearch / adelete round-trip
+    # These are the methods LangGraph actually calls under async graph execution
+    # (deepagents.create_deep_agent runs the graph with ainvoke).
+    print("\nTest 29: WeaviateStore async methods (aput/aget/asearch/adelete)...")
+    ns_async = ("store_test", "async")
+    _cleanup_store(ns_async)
+
+    async def _async_checks():
+        await store.aput(ns_async, "ak1", {"content": "async fluffy cats"}, index=["content"])
+        got = await store.aget(ns_async, "ak1")
+        assert got is not None and got.value == {"content": "async fluffy cats"}, \
+            "aget did not round-trip aput"
+        found = await store.asearch(ns_async, query="feline kittens")
+        assert any(r.key == "ak1" for r in found), "asearch did not find the async item"
+        ns_list = await store.alist_namespaces(prefix=("store_test",))
+        assert ns_async in ns_list, "alist_namespaces missing the async namespace"
+        await store.adelete(ns_async, "ak1")
+        assert await store.aget(ns_async, "ak1") is None, "adelete did not remove the item"
+
+    asyncio.run(_async_checks())
+    print("  async aput/aget/asearch/alist_namespaces/adelete all passed")
+
+    # 30. batch / abatch dispatch over Op types (the abstract BaseStore surface)
+    print("\nTest 30: WeaviateStore batch/abatch dispatch...")
+    from langgraph.store.base import GetOp, PutOp, SearchOp, ListNamespacesOp
+
+    ns_batch = ("store_test", "batch")
+    _cleanup_store(ns_batch)
+
+    # batch: a PutOp followed by a GetOp for the same key
+    put_res, get_res = store.batch([
+        PutOp(ns_batch, "bk1", {"content": "batched value"}, ["content"]),
+        GetOp(ns_batch, "bk1"),
+    ])
+    assert put_res is None, "PutOp should return None"
+    assert get_res is not None and get_res.value == {"content": "batched value"}, \
+        "GetOp via batch did not return the put value"
+
+    # batch: SearchOp and ListNamespacesOp
+    search_res = store.batch([SearchOp(ns_batch, query="batched")])[0]
+    assert any(r.key == "bk1" for r in search_res), "SearchOp via batch found nothing"
+
+    # PutOp with value=None is the delete convention
+    store.batch([PutOp(ns_batch, "bk1", None)])
+    assert store.get(ns_batch, "bk1") is None, "PutOp(value=None) did not delete"
+
+    # abatch mirrors batch on the async path
+    async def _abatch_checks():
+        res = await store.abatch([
+            PutOp(ns_batch, "bk2", {"content": "abatched"}, ["content"]),
+            GetOp(ns_batch, "bk2"),
+        ])
+        assert res[1] is not None and res[1].value == {"content": "abatched"}, \
+            "abatch GetOp did not round-trip"
+
+    asyncio.run(_abatch_checks())
+    print("  batch/abatch dispatch over Get/Put/Search/ListNamespaces passed")
+
+    _cleanup_store(ns_a, ns_b, ns_deep, ns_async, ns_batch)
     print("Cleaned up WeaviateStore test items.")
 
     print("\nAll integration tests passed successfully!")

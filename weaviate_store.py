@@ -1,37 +1,72 @@
 """
-LangGraph BaseStore backed by Weaviate.
+LangGraph ``BaseStore`` backed by Weaviate.
 
-Namespace tuples are serialised with US (\\x1f) as a separator — a non-printable
-byte that won't appear in normal namespace strings.
+This is a drop-in store for LangChain Deep Agents.  Construct it and hand it
+straight to the real ``deepagents.create_deep_agent`` — no custom agent factory
+required::
 
-Vectors come from the same t2v-transformers inference service that the rest of
-the project uses, so no extra embedding dependency is required.  Pass a custom
-``embedder`` callable to override (useful in tests or when a different model is
-preferred).
-
-Usage::
-
-    from weaviate_store import WeaviateStore
     import weaviate
+    from deepagents import create_deep_agent
+    from deepagents.backends import StoreBackend
+    from weaviate_store import WeaviateStore
 
     client = weaviate.connect_to_local()
-    store  = WeaviateStore(client)
-    agent  = create_deep_agent(store=store)
+    store  = WeaviateStore(client)            # Weaviate is the persistence layer
+    agent  = create_deep_agent(
+        model="anthropic:claude-sonnet-4-6",
+        backend=StoreBackend(),               # routes the filesystem tools to the store
+        store=store,
+    )
+
+Required contract (langgraph.store.base.BaseStore)
+--------------------------------------------------
+The abstract surface is the two batch entrypoints, ``batch`` and ``abatch``;
+LangGraph's concrete convenience methods (``get``/``put``/``search``/... and the
+``a*`` variants) delegate to them.  The docs additionally specify the five async
+operations as the contract a store must honour:
+
+    aget(namespace, key)
+    aput(namespace, key, value, index=None)
+    adelete(namespace, key)
+    asearch(namespace_prefix, *, query=None, filter=None, limit=10, offset=0)
+    alist_namespaces(*, prefix=None, suffix=None, max_depth=None, limit=100, offset=0)
+
+We implement all of the above plus their sync counterparts plus ``batch`` /
+``abatch`` so the store works under both sync and async graph execution.  The
+Weaviate Python client is synchronous, so the async methods offload the blocking
+work to a thread (via ``asyncio.to_thread``) to avoid stalling the event loop.
+
+Namespace tuples are serialised with the unit-separator byte (\\x1f), which will
+not appear in normal namespace strings.
+
+Vectors come from the same t2v-transformers inference service the rest of the
+project uses, so no extra embedding dependency is required.  Pass a custom
+``embedder`` callable to override (useful in tests or for a different model).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import requests
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property
 from weaviate.classes.query import Filter, MetadataQuery
-from langgraph.store.base import BaseStore, Item, SearchItem
+from langgraph.store.base import (
+    BaseStore,
+    GetOp,
+    Item,
+    ListNamespacesOp,
+    Op,
+    PutOp,
+    Result,
+    SearchItem,
+    SearchOp,
+)
 
 _COLLECTION = "StoreItem"
 _SEP = "\x1f"          # unit-separator — safe namespace delimiter
@@ -50,10 +85,14 @@ class WeaviateStore(BaseStore):
     """
     Weaviate-backed LangGraph store.
 
-    put() stores items and computes their vector from indexed fields so that
-    search() can rank results with a near_vector query.  Items stored without
-    an index (index=False) get no vector and are excluded from semantic search.
+    Items are kept in a dedicated ``StoreItem`` collection with self-managed
+    vectors (vectorizer=none).  ``put`` derives an embedding from the indexed
+    fields so ``search`` can rank with a ``near_vector`` query; items written
+    with ``index=False`` get no vector and are excluded from semantic search.
     """
+
+    # BaseStore advertises whether the store supports TTL / vector search.
+    supports_ttl = False
 
     def __init__(
         self,
@@ -83,8 +122,8 @@ class WeaviateStore(BaseStore):
                 Property(name="created_at", data_type=DataType.DATE, skip_vectorization=True),
                 Property(name="updated_at", data_type=DataType.DATE, skip_vectorization=True),
             ],
-            # We own all vectors; the transformers module is not used here so
-            # the collection does not need to be re-created if the module changes.
+            # We own all vectors; the transformers module is not used by the
+            # collection, so it never needs re-creating if that module changes.
             vectorizer_config=Configure.Vectorizer.none(),
         )
 
@@ -95,7 +134,7 @@ class WeaviateStore(BaseStore):
     def _embed(self, text: str) -> list[float]:
         """Return the embedding vector for *text*.
 
-        Uses the plugged-in embedder if provided; falls back to the local
+        Uses the plugged-in embedder if provided; otherwise calls the local
         t2v-transformers inference service that docker-compose already runs.
         """
         if self._embedder is not None:
@@ -110,16 +149,16 @@ class WeaviateStore(BaseStore):
 
     def _index_text(self, value: dict[str, Any], index: list[str] | bool | None) -> Optional[str]:
         """
-        Return the text to embed for a given value + index spec, or None when
-        the item should not be vectorised.
+        Return the text to embed for a value + index spec, or None if the item
+        should not be vectorised.
 
-        - index=False / None → not indexed
-        - index=True         → join all top-level string values
-        - index=[…]          → join the named string fields
+        - index=False        → not indexed (no vector, excluded from search)
+        - index=None / True  → embed all top-level string values
+        - index=[...]        → embed the named string fields
         """
-        if not index:
+        if index is False:
             return None
-        if index is True:
+        if index is None or index is True:
             parts = [str(v) for v in value.values() if isinstance(v, str) and v]
         else:
             parts = [str(value[k]) for k in index if k in value and isinstance(value[k], str)]
@@ -128,12 +167,6 @@ class WeaviateStore(BaseStore):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _ns_filter(self, namespace: tuple[str, ...]) -> Filter:
-        return (
-            Filter.by_property("namespace").equal(_ns_encode(namespace))
-            & Filter.by_property("key").equal  # filled by callers
-        )
 
     def _lookup(self, namespace: tuple[str, ...], key: str):
         """Return the raw Weaviate object for (namespace, key), or None."""
@@ -162,7 +195,7 @@ class WeaviateStore(BaseStore):
         p = obj.properties
         score = None
         if obj.metadata:
-            score = obj.metadata.certainty or obj.metadata.score
+            score = obj.metadata.certainty if obj.metadata.certainty is not None else obj.metadata.score
         return SearchItem(
             namespace=_ns_decode(p["namespace"]),
             key=p["key"],
@@ -172,11 +205,21 @@ class WeaviateStore(BaseStore):
             score=score,
         )
 
+    def _ns_prefix_filter(self, namespace_prefix: tuple[str, ...]) -> Optional[Filter]:
+        """A filter matching the exact namespace or any deeper sub-namespace."""
+        if not namespace_prefix:
+            return None
+        encoded = _ns_encode(namespace_prefix)
+        return (
+            Filter.by_property("namespace").equal(encoded)
+            | Filter.by_property("namespace").like(f"{encoded}{_SEP}*")
+        )
+
     # ------------------------------------------------------------------
-    # BaseStore interface
+    # Sync implementation (the real Weaviate work lives here)
     # ------------------------------------------------------------------
 
-    def get(self, namespace: tuple[str, ...], key: str) -> Optional[Item]:
+    def get(self, namespace: tuple[str, ...], key: str, *, refresh_ttl: Optional[bool] = None) -> Optional[Item]:
         obj = self._lookup(namespace, key)
         return self._to_item(obj) if obj is not None else None
 
@@ -186,6 +229,8 @@ class WeaviateStore(BaseStore):
         key: str,
         value: dict[str, Any],
         index: list[str] | bool | None = None,
+        *,
+        ttl: Optional[float] = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         props = {
@@ -194,7 +239,7 @@ class WeaviateStore(BaseStore):
             "value": json.dumps(value),
         }
 
-        # Compute vector only when the item should be searchable.
+        # Compute a vector only when the item should be searchable.
         vector = None
         text = self._index_text(value, index)
         if text:
@@ -219,36 +264,6 @@ class WeaviateStore(BaseStore):
         if obj is not None:
             self.col.data.delete_by_id(obj.uuid)
 
-    def list_namespaces(
-        self,
-        *,
-        prefix: Optional[tuple[str, ...]] = None,
-        suffix: Optional[tuple[str, ...]] = None,
-        max_depth: Optional[int] = None,
-        limit: int = 100,
-    ) -> list[tuple[str, ...]]:
-        # Weaviate has no DISTINCT query, so we group via aggregate then decode.
-        agg = self.col.aggregate.over_all(group_by="namespace")
-        seen: set[tuple[str, ...]] = set()
-        results: list[tuple[str, ...]] = []
-
-        for group in agg.groups:
-            ns = _ns_decode(group.grouped_by.value)
-
-            if prefix and ns[: len(prefix)] != prefix:
-                continue
-            if suffix and ns[-len(suffix) :] != suffix:
-                continue
-
-            trimmed = ns[:max_depth] if max_depth is not None else ns
-            if trimmed not in seen:
-                seen.add(trimmed)
-                results.append(trimmed)
-            if len(results) >= limit:
-                break
-
-        return results
-
     def search(
         self,
         namespace_prefix: tuple[str, ...],
@@ -257,20 +272,13 @@ class WeaviateStore(BaseStore):
         filter: Optional[dict[str, Any]] = None,
         limit: int = 10,
         offset: int = 0,
+        refresh_ttl: Optional[bool] = None,
     ) -> list[SearchItem]:
-        # Build a Weaviate filter that restricts to the requested namespace prefix.
-        if namespace_prefix:
-            encoded_prefix = _ns_encode(namespace_prefix)
-            # Exact match covers single-part namespaces; LIKE covers deeper ones.
-            ns_filter = Filter.by_property("namespace").equal(encoded_prefix) | \
-                        Filter.by_property("namespace").like(f"{encoded_prefix}{_SEP}*")
-        else:
-            ns_filter = None
+        ns_filter = self._ns_prefix_filter(namespace_prefix)
 
         if query is not None:
-            query_vector = self._embed(query)
             response = self.col.query.near_vector(
-                near_vector=query_vector,
+                near_vector=self._embed(query),
                 filters=ns_filter,
                 limit=limit,
                 offset=offset,
@@ -283,4 +291,135 @@ class WeaviateStore(BaseStore):
                 offset=offset,
             )
 
-        return [self._to_search_item(obj) for obj in response.objects]
+        items = [self._to_search_item(obj) for obj in response.objects]
+
+        # Optional exact-match value filtering, applied client-side.
+        if filter:
+            items = [
+                it for it in items
+                if all(it.value.get(k) == v for k, v in filter.items())
+            ]
+        return items
+
+    def list_namespaces(
+        self,
+        *,
+        prefix: Optional[tuple[str, ...]] = None,
+        suffix: Optional[tuple[str, ...]] = None,
+        max_depth: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        # Weaviate has no DISTINCT query, so we group via aggregate then decode.
+        agg = self.col.aggregate.over_all(group_by="namespace")
+        seen: set[tuple[str, ...]] = set()
+        ordered: list[tuple[str, ...]] = []
+
+        for group in agg.groups:
+            ns = _ns_decode(group.grouped_by.value)
+            if prefix and ns[: len(prefix)] != prefix:
+                continue
+            if suffix and ns[-len(suffix):] != suffix:
+                continue
+            trimmed = ns[:max_depth] if max_depth is not None else ns
+            if trimmed not in seen:
+                seen.add(trimmed)
+                ordered.append(trimmed)
+
+        return ordered[offset: offset + limit]
+
+    # ------------------------------------------------------------------
+    # Async implementation (required contract) — offload blocking I/O
+    # ------------------------------------------------------------------
+
+    async def aget(self, namespace: tuple[str, ...], key: str, *, refresh_ttl: Optional[bool] = None) -> Optional[Item]:
+        return await asyncio.to_thread(self.get, namespace, key)
+
+    async def aput(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+        index: list[str] | bool | None = None,
+        *,
+        ttl: Optional[float] = None,
+    ) -> None:
+        return await asyncio.to_thread(self.put, namespace, key, value, index)
+
+    async def adelete(self, namespace: tuple[str, ...], key: str) -> None:
+        return await asyncio.to_thread(self.delete, namespace, key)
+
+    async def asearch(
+        self,
+        namespace_prefix: tuple[str, ...],
+        *,
+        query: Optional[str] = None,
+        filter: Optional[dict[str, Any]] = None,
+        limit: int = 10,
+        offset: int = 0,
+        refresh_ttl: Optional[bool] = None,
+    ) -> list[SearchItem]:
+        return await asyncio.to_thread(
+            lambda: self.search(
+                namespace_prefix, query=query, filter=filter, limit=limit, offset=offset
+            )
+        )
+
+    async def alist_namespaces(
+        self,
+        *,
+        prefix: Optional[tuple[str, ...]] = None,
+        suffix: Optional[tuple[str, ...]] = None,
+        max_depth: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        return await asyncio.to_thread(
+            lambda: self.list_namespaces(
+                prefix=prefix, suffix=suffix, max_depth=max_depth, limit=limit, offset=offset
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Batch entrypoints (the abstract surface of BaseStore)
+    # ------------------------------------------------------------------
+
+    def _dispatch(self, op: Op) -> Result:
+        if isinstance(op, GetOp):
+            return self.get(op.namespace, op.key)
+        if isinstance(op, SearchOp):
+            return self.search(
+                op.namespace_prefix,
+                query=op.query,
+                filter=op.filter,
+                limit=op.limit,
+                offset=op.offset,
+            )
+        if isinstance(op, PutOp):
+            # A PutOp with value=None is the delete convention.
+            if op.value is None:
+                self.delete(op.namespace, op.key)
+            else:
+                self.put(op.namespace, op.key, op.value, op.index)
+            return None
+        if isinstance(op, ListNamespacesOp):
+            prefix = suffix = None
+            for cond in (op.match_conditions or ()):
+                if cond.match_type == "prefix":
+                    prefix = cond.path
+                elif cond.match_type == "suffix":
+                    suffix = cond.path
+            return self.list_namespaces(
+                prefix=prefix,
+                suffix=suffix,
+                max_depth=op.max_depth,
+                limit=op.limit,
+                offset=op.offset,
+            )
+        raise TypeError(f"Unsupported store operation: {type(op).__name__}")
+
+    def batch(self, ops: Iterable[Op]) -> list[Result]:
+        return [self._dispatch(op) for op in ops]
+
+    async def abatch(self, ops: Iterable[Op]) -> list[Result]:
+        return await asyncio.to_thread(self.batch, list(ops))
