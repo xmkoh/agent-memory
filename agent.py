@@ -1,11 +1,13 @@
 import os
 import sys
 import argparse
+import asyncio
 import weaviate
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from memory_manager import WeaviateMemoryManager, WeaviateChatMessageHistory
+from weaviate_store import WeaviateStore
 
 # Ensure API credentials are set
 token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
@@ -228,6 +230,31 @@ tools = [
 # Map tool names to objects for execution
 tool_map = {t.name: t for t in tools}
 llm_with_tools = llm.bind_tools(tools)
+
+
+def build_weaviate_store() -> WeaviateStore:
+    """
+    Construct the Weaviate-backed LangGraph store from the existing manager.
+
+    The store wraps the same WeaviateMemoryManager the file tools use, so
+    memories written via the store and files written via write_file/edit_file
+    live in the same Document and Chunk collections.
+
+    Hand the returned store straight to LangChain Deep Agents'
+    ``create_deep_agent``::
+
+        from deepagents import create_deep_agent
+        from deepagents.backends import StoreBackend
+
+        store = build_weaviate_store()
+        agent = create_deep_agent(
+            model="anthropic:claude-sonnet-4-6",
+            backend=StoreBackend(),
+            store=store,
+        )
+    """
+    return WeaviateStore(memory_manager)
+
 
 # Conversational Agent Loop with Memory persistence
 def execute_agent(user_input: str, thread_id: str) -> str:
@@ -560,6 +587,179 @@ The production deployment will run on AWS ECS with auto-scaling groups.
             memory_manager._delete_chunks_for(doc.uuid)
             memory_manager.document_collection.data.delete_by_id(doc.uuid)
     print("Cleaned up conflict-check test files.")
+
+    # --- WeaviateStore tests ---
+    # WeaviateStore wraps memory_manager — no separate collection, no mock embedder.
+    # Semantic search uses the existing Chunk collection (text2vec-transformers).
+    from weaviate_store import WeaviateStore
+    from weaviate.classes.query import Filter as _Filter
+
+    store = WeaviateStore(memory_manager)
+
+    def _cleanup_store(*namespaces):
+        for ns in namespaces:
+            folder = "/".join(ns)
+            docs = memory_manager.document_collection.query.fetch_objects(
+                filters=_Filter.by_property("folder_path").equal(folder),
+                limit=1000,
+            ).objects
+            for obj in docs:
+                memory_manager._delete_chunks_for(obj.uuid)
+                memory_manager.document_collection.data.delete_by_id(obj.uuid)
+
+    ns_a = ("store_test", "alpha")
+    ns_b = ("store_test", "beta")
+    ns_deep = ("store_test", "alpha", "deep")
+    _cleanup_store(ns_a, ns_b, ns_deep)
+
+    # 19. put and get round-trip
+    print("\nTest 19: WeaviateStore put and get...")
+    store.put(ns_a, "k1", {"msg": "hello world"}, index=True)
+    item = store.get(ns_a, "k1")
+    assert item is not None, "get returned None after put"
+    assert item.key == "k1", "item key mismatch"
+    assert item.namespace == ns_a, "item namespace mismatch"
+    assert item.value == {"msg": "hello world"}, "item value mismatch"
+    assert item.created_at is not None, "created_at missing"
+    print(f"  got: {item.value}")
+
+    # 20. get on missing key returns None
+    print("\nTest 20: WeaviateStore get on missing key returns None...")
+    missing = store.get(ns_a, "does_not_exist")
+    assert missing is None, "get on missing key did not return None"
+    print("  returned None as expected")
+
+    # 21. put upserts (second put with same key updates value)
+    print("\nTest 21: WeaviateStore upsert via repeated put...")
+    store.put(ns_a, "k1", {"msg": "updated"}, index=True)
+    updated = store.get(ns_a, "k1")
+    assert updated.value == {"msg": "updated"}, "upsert did not update value"
+    print(f"  updated value: {updated.value}")
+
+    # 22. delete removes the item
+    print("\nTest 22: WeaviateStore delete...")
+    store.put(ns_a, "to_delete", {"x": 1})
+    store.delete(ns_a, "to_delete")
+    assert store.get(ns_a, "to_delete") is None, "item still present after delete"
+    store.delete(ns_a, "to_delete")  # deleting a non-existent key must not raise
+    print("  deleted successfully; double-delete did not raise")
+
+    # 23. list_namespaces returns distinct namespaces
+    print("\nTest 23: WeaviateStore list_namespaces...")
+    store.put(ns_a, "x", {"v": 1})
+    store.put(ns_b, "y", {"v": 2})
+    store.put(ns_deep, "z", {"v": 3})
+    all_ns = store.list_namespaces()
+    assert ns_a in all_ns, f"ns_a missing from list_namespaces: {all_ns}"
+    assert ns_b in all_ns, f"ns_b missing from list_namespaces: {all_ns}"
+    print(f"  namespaces: {all_ns}")
+
+    # 24. list_namespaces prefix filter
+    print("\nTest 24: WeaviateStore list_namespaces with prefix...")
+    prefix_ns = store.list_namespaces(prefix=("store_test",))
+    assert ns_a in prefix_ns, "ns_a missing with prefix filter"
+    assert ns_b in prefix_ns, "ns_b missing with prefix filter"
+    assert all(ns[0] == "store_test" for ns in prefix_ns), \
+        "prefix filter let through wrong namespace"
+    print(f"  filtered: {prefix_ns}")
+
+    # 25. list_namespaces max_depth truncates namespace tuples
+    print("\nTest 25: WeaviateStore list_namespaces max_depth=1...")
+    depth1 = store.list_namespaces(prefix=("store_test",), max_depth=1)
+    assert all(len(ns) == 1 for ns in depth1), \
+        f"max_depth=1 did not truncate: {depth1}"
+    assert ("store_test",) in depth1, "truncated root namespace missing"
+    print(f"  depth-1 namespaces: {depth1}")
+
+    # 26. search without query returns items by namespace prefix (no ranking)
+    print("\nTest 26: WeaviateStore search without query...")
+    unranked = store.search(("store_test",))
+    paths = [(r.namespace, r.key) for r in unranked]
+    assert any(ns == ns_a for ns, _ in paths), "ns_a items missing from unranked search"
+    assert any(ns == ns_b for ns, _ in paths), "ns_b items missing from unranked search"
+    print(f"  returned {len(unranked)} items")
+
+    # 27. search with query returns ranked SearchItems with scores
+    print("\nTest 27: WeaviateStore search with query (near_text via text2vec-transformers)...")
+    store.put(ns_a, "doc_cat",  {"content": "cats are fluffy animals"}, index=["content"])
+    store.put(ns_a, "doc_dog",  {"content": "dogs are loyal companions"}, index=["content"])
+    store.put(ns_a, "doc_car",  {"content": "cars have four wheels"}, index=["content"])
+    ranked = store.search(("store_test", "alpha"), query="feline pets")
+    assert len(ranked) > 0, "near_vector search returned no results"
+    assert all(r.score is not None for r in ranked), "SearchItem scores missing"
+    # Scores should be in descending order (Weaviate returns highest certainty first)
+    scores = [r.score for r in ranked]
+    assert scores == sorted(scores, reverse=True), f"results not sorted by score: {scores}"
+    print(f"  top result: {ranked[0].value!r} (score={ranked[0].score:.4f})")
+
+    # 28. items stored with index=False have no vector and are excluded from near_vector
+    print("\nTest 28: index=False items excluded from vector search...")
+    store.put(ns_a, "no_vec", {"content": "feline cats pets kittens"}, index=False)
+    ranked2 = store.search(("store_test", "alpha"), query="feline pets")
+    no_vec_keys = [r.key for r in ranked2]
+    assert "no_vec" not in no_vec_keys, \
+        "index=False item incorrectly appeared in near_vector results"
+    print("  index=False item correctly excluded from ranked search")
+
+    # 29. Async contract: aput / aget / asearch / adelete round-trip
+    # These are the methods LangGraph actually calls under async graph execution
+    # (deepagents.create_deep_agent runs the graph with ainvoke).
+    print("\nTest 29: WeaviateStore async methods (aput/aget/asearch/adelete)...")
+    ns_async = ("store_test", "async")
+
+    async def _async_checks():
+        await store.aput(ns_async, "ak1", {"content": "async fluffy cats"}, index=["content"])
+        got = await store.aget(ns_async, "ak1")
+        assert got is not None and got.value == {"content": "async fluffy cats"}, \
+            "aget did not round-trip aput"
+        found = await store.asearch(ns_async, query="feline kittens")
+        assert any(r.key == "ak1" for r in found), "asearch did not find the async item"
+        ns_list = await store.alist_namespaces(prefix=("store_test",))
+        assert ns_async in ns_list, "alist_namespaces missing the async namespace"
+        await store.adelete(ns_async, "ak1")
+        assert await store.aget(ns_async, "ak1") is None, "adelete did not remove the item"
+
+    asyncio.run(_async_checks())
+    print("  async aput/aget/asearch/alist_namespaces/adelete all passed")
+
+    # 30. batch / abatch dispatch over Op types (the abstract BaseStore surface)
+    print("\nTest 30: WeaviateStore batch/abatch dispatch...")
+    from langgraph.store.base import GetOp, PutOp, SearchOp, ListNamespacesOp
+
+    ns_batch = ("store_test", "batch")
+    _cleanup_store(ns_batch)
+
+    # batch: a PutOp followed by a GetOp for the same key
+    put_res, get_res = store.batch([
+        PutOp(ns_batch, "bk1", {"content": "batched value"}, ["content"]),
+        GetOp(ns_batch, "bk1"),
+    ])
+    assert put_res is None, "PutOp should return None"
+    assert get_res is not None and get_res.value == {"content": "batched value"}, \
+        "GetOp via batch did not return the put value"
+
+    # batch: SearchOp and ListNamespacesOp
+    search_res = store.batch([SearchOp(ns_batch, query="batched")])[0]
+    assert any(r.key == "bk1" for r in search_res), "SearchOp via batch found nothing"
+
+    # PutOp with value=None is the delete convention
+    store.batch([PutOp(ns_batch, "bk1", None)])
+    assert store.get(ns_batch, "bk1") is None, "PutOp(value=None) did not delete"
+
+    # abatch mirrors batch on the async path
+    async def _abatch_checks():
+        res = await store.abatch([
+            PutOp(ns_batch, "bk2", {"content": "abatched"}, ["content"]),
+            GetOp(ns_batch, "bk2"),
+        ])
+        assert res[1] is not None and res[1].value == {"content": "abatched"}, \
+            "abatch GetOp did not round-trip"
+
+    asyncio.run(_abatch_checks())
+    print("  batch/abatch dispatch over Get/Put/Search/ListNamespaces passed")
+
+    _cleanup_store(ns_a, ns_b, ns_deep, ns_async, ns_batch)
+    print("Cleaned up WeaviateStore test items.")
 
     print("\nAll integration tests passed successfully!")
     client.close()
