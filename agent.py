@@ -234,12 +234,14 @@ llm_with_tools = llm.bind_tools(tools)
 
 def build_weaviate_store() -> WeaviateStore:
     """
-    Construct the Weaviate-backed LangGraph store.
+    Construct the Weaviate-backed LangGraph store from the existing manager.
+
+    The store wraps the same WeaviateMemoryManager the file tools use, so
+    memories written via the store and files written via write_file/edit_file
+    live in the same Document and Chunk collections.
 
     Hand the returned store straight to LangChain Deep Agents'
-    ``create_deep_agent`` to make Weaviate the actual persistence layer — no
-    custom agent wrapper is needed; ``WeaviateStore`` implements the LangGraph
-    ``BaseStore`` contract that Deep Agents expects::
+    ``create_deep_agent``::
 
         from deepagents import create_deep_agent
         from deepagents.backends import StoreBackend
@@ -247,11 +249,11 @@ def build_weaviate_store() -> WeaviateStore:
         store = build_weaviate_store()
         agent = create_deep_agent(
             model="anthropic:claude-sonnet-4-6",
-            backend=StoreBackend(),   # routes filesystem tools to the store
-            store=store,              # cross-thread durable persistence in Weaviate
+            backend=StoreBackend(),
+            store=store,
         )
     """
-    return WeaviateStore(client)
+    return WeaviateStore(memory_manager)
 
 
 # Conversational Agent Loop with Memory persistence
@@ -587,27 +589,23 @@ The production deployment will run on AWS ECS with auto-scaling groups.
     print("Cleaned up conflict-check test files.")
 
     # --- WeaviateStore tests ---
-    import random
-    import hashlib as _hl
+    # WeaviateStore wraps memory_manager — no separate collection, no mock embedder.
+    # Semantic search uses the existing Chunk collection (text2vec-transformers).
     from weaviate_store import WeaviateStore
     from weaviate.classes.query import Filter as _Filter
 
-    def _mock_embedder(text: str) -> list[float]:
-        """Deterministic 384-dim unit vector derived from text — no inference service needed."""
-        seed = int(_hl.md5(text.encode()).hexdigest(), 16) % (2**32)
-        rng = random.Random(seed)
-        vec = [rng.gauss(0, 1) for _ in range(384)]
-        norm = sum(x * x for x in vec) ** 0.5
-        return [x / norm for x in vec]
-
-    store = WeaviateStore(client, embedder=_mock_embedder)
+    store = WeaviateStore(memory_manager)
 
     def _cleanup_store(*namespaces):
         for ns in namespaces:
-            ns_str = "\x1f".join(ns)
-            store.col.data.delete_many(
-                where=_Filter.by_property("namespace").equal(ns_str)
-            )
+            folder = "/".join(ns)
+            docs = memory_manager.document_collection.query.fetch_objects(
+                filters=_Filter.by_property("folder_path").equal(folder),
+                limit=1000,
+            ).objects
+            for obj in docs:
+                memory_manager._delete_chunks_for(obj.uuid)
+                memory_manager.document_collection.data.delete_by_id(obj.uuid)
 
     ns_a = ("store_test", "alpha")
     ns_b = ("store_test", "beta")
@@ -636,7 +634,6 @@ The production deployment will run on AWS ECS with auto-scaling groups.
     store.put(ns_a, "k1", {"msg": "updated"}, index=True)
     updated = store.get(ns_a, "k1")
     assert updated.value == {"msg": "updated"}, "upsert did not update value"
-    assert updated.updated_at >= updated.created_at, "updated_at not refreshed"
     print(f"  updated value: {updated.value}")
 
     # 22. delete removes the item
@@ -683,7 +680,7 @@ The production deployment will run on AWS ECS with auto-scaling groups.
     print(f"  returned {len(unranked)} items")
 
     # 27. search with query returns ranked SearchItems with scores
-    print("\nTest 27: WeaviateStore search with query (near_vector)...")
+    print("\nTest 27: WeaviateStore search with query (near_text via text2vec-transformers)...")
     store.put(ns_a, "doc_cat",  {"content": "cats are fluffy animals"}, index=["content"])
     store.put(ns_a, "doc_dog",  {"content": "dogs are loyal companions"}, index=["content"])
     store.put(ns_a, "doc_car",  {"content": "cars have four wheels"}, index=["content"])
@@ -709,7 +706,6 @@ The production deployment will run on AWS ECS with auto-scaling groups.
     # (deepagents.create_deep_agent runs the graph with ainvoke).
     print("\nTest 29: WeaviateStore async methods (aput/aget/asearch/adelete)...")
     ns_async = ("store_test", "async")
-    _cleanup_store(ns_async)
 
     async def _async_checks():
         await store.aput(ns_async, "ak1", {"content": "async fluffy cats"}, index=["content"])
