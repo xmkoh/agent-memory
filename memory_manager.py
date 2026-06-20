@@ -7,7 +7,7 @@ import re
 import fnmatch
 import hashlib
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 
 
 class ConflictError(Exception):
@@ -65,7 +65,6 @@ class WeaviateMemoryManager:
                     Property(name="role", data_type=DataType.TEXT, skip_vectorization=True),
                     Property(name="content", data_type=DataType.TEXT, skip_vectorization=True),
                     Property(name="timestamp", data_type=DataType.DATE),
-                    Property(name="metadata", data_type=DataType.TEXT, skip_vectorization=True),
                 ],
                 vectorizer_config=Configure.Vectorizer.none()
             )
@@ -305,15 +304,7 @@ class WeaviateMemoryManager:
         )
         return [group.grouped_by.value for group in response.groups]
 
-    def list_files_in_folder(self, folder_path: str) -> list:
-        """Returns exact filenames located inside a specific virtual path."""
-        response = self.document_collection.query.fetch_objects(
-            filters=Filter.by_property("folder_path").equal(folder_path),
-            return_properties=["filename"]
-        )
-        return [obj.properties["filename"] for obj in response.objects]
-
-    def write_chat_message(self, thread_id: str, role: str, content: str, metadata: str = None):
+    def write_chat_message(self, thread_id: str, role: str, content: str):
         """Writes a single message to conversational history in Weaviate."""
         self.chat_collection.data.insert(
             properties={
@@ -321,7 +312,6 @@ class WeaviateMemoryManager:
                 "role": role,
                 "content": content,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "metadata": metadata or ""
             }
         )
 
@@ -364,25 +354,14 @@ class WeaviateChatMessageHistory(BaseChatMessageHistory):
         for msg in raw_msgs:
             role = msg["role"]
             content = msg["content"]
-            if role == "user":
-                langchain_msgs.append(HumanMessage(content=content))
-            elif role == "assistant":
+            if role == "assistant":
                 langchain_msgs.append(AIMessage(content=content))
-            elif role == "system":
-                langchain_msgs.append(SystemMessage(content=content))
             else:
                 langchain_msgs.append(HumanMessage(content=content))
         return langchain_msgs
 
     def add_message(self, message: BaseMessage) -> None:
-        if isinstance(message, HumanMessage):
-            role = "user"
-        elif isinstance(message, AIMessage):
-            role = "assistant"
-        elif isinstance(message, SystemMessage):
-            role = "system"
-        else:
-            role = "user"
+        role = "assistant" if isinstance(message, AIMessage) else "user"
         self.memory_manager.write_chat_message(self.thread_id, role, message.content)
 
     def clear(self) -> None:
