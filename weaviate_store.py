@@ -208,8 +208,15 @@ class WeaviateStore(BaseStore):
             )
 
         # Rebuild the semantic chunks unless the caller explicitly opts out.
+        #   index is False        -> store no vector
+        #   index is a list[str]  -> embed only those top-level fields of `value`
+        #   index is True / None  -> embed the whole serialised value
         if index is not False:
-            chunks = self.manager._chunk_content(content)
+            if isinstance(index, list):
+                to_index = "\n".join(str(value[f]) for f in index if f in value)
+            else:
+                to_index = content
+            chunks = self.manager._chunk_content(to_index)
             self.manager._insert_chunks(chunks, doc_uuid)
 
     def delete(self, namespace: tuple[str, ...], key: str) -> None:
@@ -229,6 +236,7 @@ class WeaviateStore(BaseStore):
         refresh_ttl: Optional[bool] = None,
     ) -> list[SearchItem]:
         folder_prefix = _ns_to_folder(namespace_prefix)
+        needed = limit + offset
 
         if query is not None:
             # Use near_text on the Chunk collection.  The text2vec-transformers
@@ -242,25 +250,41 @@ class WeaviateStore(BaseStore):
                       .like(f"{folder_prefix}/*")
             ) if folder_prefix else None
 
-            response = self._chunks.query.near_text(
-                query=query,
-                filters=ns_filter,
-                limit=limit + offset,
-                return_metadata=MetadataQuery(certainty=True, score=True),
-                return_references=[wq.QueryReference(link_on="hasDocument")],
-            )
-
-            # Deduplicate by parent document (a document may have many chunks).
+            # A document has many chunks, so near_text ranks chunks, not docs.
+            # Page through chunks (over-fetching, since several collapse into one
+            # doc) and dedup to parents until we have `needed` distinct documents
+            # or the chunk stream is exhausted.  Without this, a few multi-chunk
+            # docs at the top of the ranking would starve the result of other
+            # matching docs whose chunks rank lower.
+            page = max(needed * 4, 40)
+            chunk_offset = 0
             seen: dict[str, SearchItem] = {}
-            for chunk_obj in response.objects:
-                si = self._chunk_obj_to_search_item(chunk_obj)
-                if si is None:
-                    continue
-                doc_key = f"{si.namespace}:{si.key}"
-                if doc_key not in seen:
-                    seen[doc_key] = si
+            while True:
+                response = self._chunks.query.near_text(
+                    query=query,
+                    filters=ns_filter,
+                    limit=page,
+                    offset=chunk_offset,
+                    return_metadata=MetadataQuery(certainty=True, score=True),
+                    return_references=[wq.QueryReference(link_on="hasDocument")],
+                )
+                for chunk_obj in response.objects:
+                    si = self._chunk_obj_to_search_item(chunk_obj)
+                    if si is None:
+                        continue
+                    doc_key = f"{si.namespace}:{si.key}"
+                    if doc_key not in seen:
+                        seen[doc_key] = si
+                # When a value filter will prune results we cannot know how many
+                # survive, so drain every matching chunk; otherwise stop as soon
+                # as we have enough distinct docs to fill the window.
+                if filter is None and len(seen) >= needed:
+                    break
+                if len(response.objects) < page:
+                    break
+                chunk_offset += page
 
-            items: list[SearchItem] = list(seen.values())[offset: offset + limit]
+            items: list[SearchItem] = list(seen.values())
         else:
             # No query: list documents whose folder_path starts with the prefix.
             ns_filter = (
@@ -268,10 +292,12 @@ class WeaviateStore(BaseStore):
                 | Filter.by_property("folder_path").like(f"{folder_prefix}/*")
             ) if folder_prefix else None
 
+            # Fetch only the window when nothing will be pruned; over-fetch when a
+            # value filter will drop rows, so the window is filled from survivors.
+            # offset is always applied to the filtered result below, never here.
             response = self._docs.query.fetch_objects(
                 filters=ns_filter,
-                limit=limit,
-                offset=offset,
+                limit=10000 if filter else needed,
             )
             items = []
             for obj in response.objects:
@@ -287,10 +313,12 @@ class WeaviateStore(BaseStore):
                     score=None,
                 ))
 
+        # Apply the value filter, then the offset/limit window — in that order, so
+        # neither dedup nor filtering can shrink the page below `limit`.
         if filter:
             items = [it for it in items
                      if all(it.value.get(k) == v for k, v in filter.items())]
-        return items
+        return items[offset: offset + limit]
 
     def list_namespaces(
         self,

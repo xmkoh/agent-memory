@@ -7,7 +7,6 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from memory_manager import WeaviateMemoryManager, WeaviateChatMessageHistory
-from weaviate_store import WeaviateStore
 
 # Ensure API credentials are set
 token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
@@ -44,17 +43,6 @@ def write_memory_file(filename: str, folder_path: str, content: str) -> str:
         return f"Error writing file to memory: {e}"
 
 @tool
-def read_memory_file(filename: str) -> str:
-    """
-    Retrieves the full raw content of a specific file from long-term memory by its name.
-    """
-    try:
-        content = memory_manager.read_file_by_name(filename)
-        return content
-    except Exception as e:
-        return f"Error reading file from memory: {e}"
-
-@tool
 def search_memory(query: str, restrict_to_folder: str = None) -> str:
     """
     Performs a semantic search over all documents in long-term memory.
@@ -84,19 +72,6 @@ def list_memory_folders() -> str:
         return f"Folders in memory: {folders}"
     except Exception as e:
         return f"Error listing folders: {e}"
-
-@tool
-def list_memory_files(folder_path: str) -> str:
-    """
-    Lists all filenames stored in a specific folder inside the long-term memory database.
-    """
-    try:
-        files = memory_manager.list_files_in_folder(folder_path)
-        if not files:
-            return f"No files found in folder '{folder_path}'."
-        return f"Files in '{folder_path}': {files}"
-    except Exception as e:
-        return f"Error listing files: {e}"
 
 # --- Deepagents-style filesystem tools (backed by the Weaviate document store) ---
 
@@ -215,10 +190,8 @@ def grep(pattern: str, output_mode: str = "content", restrict_to_folder: str = N
 
 tools = [
     write_memory_file,
-    read_memory_file,
     search_memory,
     list_memory_folders,
-    list_memory_files,
     ls,
     read_file,
     write_file,
@@ -230,30 +203,6 @@ tools = [
 # Map tool names to objects for execution
 tool_map = {t.name: t for t in tools}
 llm_with_tools = llm.bind_tools(tools)
-
-
-def build_weaviate_store() -> WeaviateStore:
-    """
-    Construct the Weaviate-backed LangGraph store from the existing manager.
-
-    The store wraps the same WeaviateMemoryManager the file tools use, so
-    memories written via the store and files written via write_file/edit_file
-    live in the same Document and Chunk collections.
-
-    Hand the returned store straight to LangChain Deep Agents'
-    ``create_deep_agent``::
-
-        from deepagents import create_deep_agent
-        from deepagents.backends import StoreBackend
-
-        store = build_weaviate_store()
-        agent = create_deep_agent(
-            model="anthropic:claude-sonnet-4-6",
-            backend=StoreBackend(),
-            store=store,
-        )
-    """
-    return WeaviateStore(memory_manager)
 
 
 # Conversational Agent Loop with Memory persistence
@@ -368,7 +317,7 @@ The production deployment will run on AWS ECS with auto-scaling groups.
     
     # 3. Check files in folder
     print("\nTest 3: Listing files in folder...")
-    files_res = list_memory_files.invoke({"folder_path": "projects/alpha"})
+    files_res = ls.invoke({"folder_path": "projects/alpha"})
     print(files_res)
     assert "team_alpha_spec.md" in files_res, "Expected file team_alpha_spec.md not found"
     
